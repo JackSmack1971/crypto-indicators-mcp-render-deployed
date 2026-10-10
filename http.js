@@ -3,14 +3,16 @@ const http = require('node:http');
 const { timingSafeEqual } = require('node:crypto');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { createServer } = require('./server-factory');
+const oauthAuth = require('./oauth');
 const port = Number(process.env.PORT || 10000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT');
 const token = process.env.MCP_BEARER_TOKEN;
-if (!token || token.length < 24) throw new Error('MCP_BEARER_TOKEN must be set (24+ characters)');
+if (!oauthAuth.oauth && (!token || token.length < 24)) throw new Error('Configure OAuth or MCP_BEARER_TOKEN');
 const MAX_BODY_BYTES = 512 * 1024;
 const MAX_CONCURRENT = 10;
 let inFlight = 0;
-function authorized(header) {
+function legacyAuthorized(header) {
+  if (!token) return false;
   const expected = Buffer.from('Bearer ' + token);
   const supplied = Buffer.from(header || '');
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
@@ -18,18 +20,24 @@ function authorized(header) {
 const app = http.createServer(async (req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok' }));
+    return res.end(JSON.stringify({ status: 'ok', oauth_configured: Boolean(oauthAuth.oauth) }));
+  }
+  if (oauthAuth.oauth && req.method === 'GET' && (req.url === '/.well-known/oauth-protected-resource' || req.url === '/.well-known/oauth-protected-resource/mcp')) {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'public, max-age=300' });
+    return res.end(JSON.stringify(oauthAuth.metadata()));
   }
   if (req.url !== '/mcp') { res.writeHead(404); return res.end(); }
-  if (!authorized(req.headers.authorization)) { res.writeHead(401, { 'www-authenticate': 'Bearer' }); return res.end(); }
+  const allowed = oauthAuth.oauth ? Boolean(await oauthAuth.verify(req.headers.authorization)) : legacyAuthorized(req.headers.authorization);
+  if (!allowed) {
+    res.writeHead(401, { 'www-authenticate': oauthAuth.oauth ? oauthAuth.challenge() : 'Bearer' });
+    return res.end();
+  }
   if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); return res.end(); }
   if (inFlight >= MAX_CONCURRENT) { res.writeHead(503, { 'retry-after': '2' }); return res.end(); }
-  const contentType = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
-  if (contentType !== 'application/json') { res.writeHead(415); return res.end(); }
+  if (String(req.headers['content-type'] || '').split(';')[0].toLowerCase() !== 'application/json') { res.writeHead(415); return res.end(); }
   if (Number(req.headers['content-length'] || 0) > MAX_BODY_BYTES) { res.writeHead(413); return res.end(); }
   inFlight++;
-  let server;
-  let transport;
+  let server, transport;
   try {
     let size = 0;
     const parts = [];
